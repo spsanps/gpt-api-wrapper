@@ -2,7 +2,7 @@
 # Assumes OPENAI_API_KEY (and optional OPENAI_BASE_URL) are set in environment.
 from __future__ import annotations
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Iterable, Any
+from typing import List, Dict, Optional, Iterable, Any, Union
 import json
 import time
 from openai import OpenAI
@@ -11,7 +11,7 @@ DEFAULT_MODEL = "gpt-5-mini"  # adjust if you want a different model
 DEFAULT_EFFORT = "medium"  # per batch script defaults
 DEFAULT_MAX_OUTPUT_TOKENS = 16*1024  # lower than batch max for ad-hoc calls
 
-_client: OpenAI | None = None
+_client: Optional[OpenAI] = None
 
 def _get_client() -> OpenAI:
     global _client
@@ -173,7 +173,7 @@ class Conversation:
         model: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
-    ) -> str | Iterable[str]:
+    ) -> Union[str, Iterable[str]]:
         """
         Add a user turn, call the model, store the assistant reply, and return it.
 
