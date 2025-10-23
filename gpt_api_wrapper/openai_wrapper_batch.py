@@ -2,29 +2,15 @@
 # Simple, importable batch wrapper around the OpenAI Responses API with
 # optional conversation history (batched across parallel threads).
 #
-# Requirements:
-#   pip install openai python-dotenv
-# Environment:
-#   OPENAI_API_KEY=...    (and optional) OPENAI_BASE_URL=...
+# New in this version:
+# - BatchConversation.ask_masked([...Optional[str]...]): send a user turn only for
+#   selected threads (None = skip that thread this step). Returns a
+#   list aligned to thread indices with None for skipped threads.
+# - BatchConversation.ask_map({idx: prompt}): tiny convenience wrapper over ask_masked.
 #
-# Usage (single-shot batch):
-#   from openai_wrapper_batch import batch_single_prompt
-#   outs = batch_single_prompt(
-#       prompts=["Explain transformers in 2 lines", "Summarize RLHF"],
-#       system_prompt="You are concise."
-#   )
-#   print(outs)  # [str, str]
-#
-# Usage (batched conversation):
-#   from openai_wrapper_batch import BatchConversation
-#   conv = BatchConversation(count=2, system_prompt="Be brief.")
-#   print(conv.ask(["Hi there", "Hello!" ]))  # first turn
-#   print(conv.ask("What's a hash map?"))        # broadcast same user turn to both threads
-#   conv.save("conv_state.json")
-#   # Later...
-#   conv2 = BatchConversation.load("conv_state.json")
-#   print(conv2.ask(["Thanks", "Great"]))     # continues the history
-#
+# This lets you drive many conversations in parallel (e.g., 1 per problem),
+# even when they have different numbers of steps/actions, without paying for
+# completed threads or forcing no-op turns.
 
 from __future__ import annotations
 
@@ -72,7 +58,6 @@ def _extract_output_text(body: Dict[str, Any]) -> str:
     """
     Extract plain text from Responses API response body (batch shape).
     """
-    # Prefer SDK convenience if present
     if isinstance(body, dict) and body.get("output_text"):
         return str(body["output_text"]).strip()
 
@@ -107,7 +92,7 @@ def _submit_batch(jsonl_path: str, completion_window: str) -> Tuple[str, str]:
         endpoint="/v1/responses",
         completion_window=completion_window,
     )
-    return batch.id, None  # output_file_id unknown until completed
+    return batch.id, None
 
 def _poll_for_completion(batch_id: str, poll_interval: float = 5.0, verbose: bool = True) -> Dict[str, Any]:
     """
@@ -123,7 +108,6 @@ def _poll_for_completion(batch_id: str, poll_interval: float = 5.0, verbose: boo
             print(f"[batch {batch_id}] status = {status}")
             last = status
         if status not in statuses_active:
-            # completed or failed
             return b
         time.sleep(poll_interval)
 
@@ -134,7 +118,6 @@ def _download_output_file(file_id: str) -> List[Dict[str, Any]]:
     client = _get_client()
     stream = client.files.content(file_id)
     raw = stream.read()
-    # Split JSONL safely
     records = []
     for line in raw.decode("utf-8").splitlines():
         if line.strip():
@@ -185,7 +168,6 @@ def _run_batch_and_collect(
         batch_id, _ = _submit_batch(jsonl_path, completion_window)
         final = _poll_for_completion(batch_id, verbose=verbose)
         if getattr(final, "status", None) != "completed":
-            # If there is an error file, fetch it to help debugging
             err_id = getattr(final, "error_file_id", None) or getattr(final, "errors_file_id", None)
             if err_id:
                 errs = _download_output_file(err_id)
@@ -219,12 +201,10 @@ def batch_single_prompt(
     Submit one or many prompts as a single batch job.
     Always returns a list of assistant strings in the same order as inputs.
     """
-    # Normalize inputs
     items = prompts if isinstance(prompts, list) else [prompts]
     n = len(items)
     systems = _as_list(system_prompt, n, "system_prompt")
 
-    # Build message lists per item
     messages_per_item: List[List[Dict[str, str]]] = []
     for i in range(n):
         msgs: List[Dict[str, str]] = []
@@ -243,7 +223,6 @@ def batch_single_prompt(
     )
     out_records = _run_batch_and_collect(lines, completion_window, verbose=verbose)
 
-    # Map custom_id -> text
     outputs: Dict[str, str] = {}
     for r in out_records:
         cid = r.get("custom_id")
@@ -254,7 +233,6 @@ def batch_single_prompt(
             raise RuntimeError(f"Non-200 for {cid}: {status}")
         outputs[cid] = _extract_output_text(body)
 
-    # Return in original order
     return [outputs[cid] for cid in custom_ids]
 
 # ----------------- Public: batched conversation -----------------
@@ -273,6 +251,9 @@ class BatchConversation:
     Maintain N parallel conversation histories and advance them using batch jobs.
     Each call to .ask(...) adds a user turn (broadcast or per-thread list) and
     submits one batch; assistant replies are appended to each thread's history.
+
+    New: .ask_masked([...Optional[str]...]) lets you advance only the threads that
+    still have pending turns (None = skip).
     """
 
     def __init__(
@@ -349,7 +330,7 @@ class BatchConversation:
     def histories(self) -> List[List[Dict[str, str]]]:
         return [[t.to_msg() for t in thread] for thread in self._threads]
 
-    # ---- main op ----
+    # ---- main ops ----
     def ask(self, user_prompts: Union[str, List[str]], *, verbose: bool = True) -> List[str]:
         """
         Add a user turn (broadcast or list) across threads, submit a batch,
@@ -363,12 +344,10 @@ class BatchConversation:
         for i in range(self.count):
             self._threads[i].append(_Turn("user", prompts[i], now))
 
-        # Build per-thread messages with full history for this step
         messages_per_item: List[List[Dict[str, str]]] = []
         for i in range(self.count):
             messages_per_item.append([t.to_msg() for t in self._threads[i]])
 
-        # Assemble + run batch
         ns = f"conv::step{self.step}"
         lines, custom_ids = _assemble_jsonl_lines(
             messages_per_item=messages_per_item,
@@ -380,7 +359,6 @@ class BatchConversation:
         )
         out_records = _run_batch_and_collect(lines, self.completion_window, verbose=verbose)
 
-        # Collect outputs
         by_id: Dict[str, str] = {}
         for r in out_records:
             cid = r.get("custom_id")
@@ -391,14 +369,93 @@ class BatchConversation:
                 raise RuntimeError(f"Non-200 for {cid}: {status}")
             by_id[cid] = _extract_output_text(body)
 
-        # Append assistant turns in original order
         replies: List[str] = []
         for cid in custom_ids:
-            text = by_id[cid]
-            replies.append(text)
+            replies.append(by_id[cid])
+
         now2 = time.time()
         for i in range(self.count):
             self._threads[i].append(_Turn("assistant", replies[i], now2))
 
         self.step += 1
         return replies
+
+    def ask_masked(self, user_prompts_masked: List[Optional[str]], *, verbose: bool = True) -> List[Optional[str]]:
+        """
+        Add a user turn for *selected* threads only (None = skip that thread),
+        submit one batch containing just the active threads, and return a list
+        of replies aligned to thread indices (None where skipped).
+        """
+        if len(user_prompts_masked) != self.count:
+            raise ValueError(f"user_prompts_masked length {len(user_prompts_masked)} must match count={self.count}")
+
+        # Determine active threads for this step
+        active_indices = [i for i, p in enumerate(user_prompts_masked) if p is not None]
+        if not active_indices:
+            return [None] * self.count  # no-op step, no increment
+
+        now = time.time()
+        for i in active_indices:
+            self._threads[i].append(_Turn("user", user_prompts_masked[i] or "", now))
+
+        # Build payload only for active threads
+        messages_per_item: List[List[Dict[str, str]]] = []
+        id2slot: Dict[str, int] = {}  # custom_id -> thread index
+        ns = f"conv::step{self.step}"
+
+        # Assemble lines *in active order*; track mapping to thread index
+        for i in active_indices:
+            msgs = [t.to_msg() for t in self._threads[i]]
+            messages_per_item.append(msgs)
+
+        lines, custom_ids = _assemble_jsonl_lines(
+            messages_per_item=messages_per_item,
+            model=self.model,
+            reasoning_effort=self.reasoning_effort,
+            max_output_tokens=self.max_output_tokens,
+            run_tag=self.run_tag,
+            namespace=ns,
+        )
+        # Map back each custom_id to its thread index
+        for slot, cid in zip(active_indices, custom_ids):
+            id2slot[cid] = slot
+
+        out_records = _run_batch_and_collect(lines, self.completion_window, verbose=verbose)
+
+        # Collect outputs
+        slot_to_reply: Dict[int, str] = {}
+        for r in out_records:
+            cid = r.get("custom_id")
+            resp = (r.get("response") or {})
+            status = resp.get("status_code")
+            body = resp.get("body") or {}
+            if status != 200:
+                raise RuntimeError(f"Non-200 for {cid}: {status}")
+            slot = id2slot[cid]
+            slot_to_reply[slot] = _extract_output_text(body)
+
+        # Append assistant turns for active threads
+        now2 = time.time()
+        for i in active_indices:
+            reply = slot_to_reply[i]
+            self._threads[i].append(_Turn("assistant", reply, now2))
+
+        # Build aligned result (None where skipped)
+        out: List[Optional[str]] = [None] * self.count
+        for i in active_indices:
+            out[i] = slot_to_reply[i]
+
+        self.step += 1
+        return out
+
+    def ask_map(self, prompt_map: Dict[int, str], *, verbose: bool = True) -> Dict[int, str]:
+        """
+        Convenience wrapper: provide {thread_index: prompt}. Returns {thread_index: reply}.
+        """
+        masked: List[Optional[str]] = [None] * self.count
+        for i, p in prompt_map.items():
+            if i < 0 or i >= self.count:
+                raise IndexError(f"thread index out of range: {i}")
+            masked[i] = p
+        replies = self.ask_masked(masked, verbose=verbose)
+        return {i: (replies[i] or "") for i in prompt_map.keys()}
