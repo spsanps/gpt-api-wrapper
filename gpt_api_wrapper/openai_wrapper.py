@@ -19,11 +19,30 @@ def _get_client() -> OpenAI:
         _client = OpenAI()
     return _client
 
+
+def _extract_output_text_from_response(resp: Any) -> str:
+    """Normalize a Responses API SDK object into plain text."""
+
+    if hasattr(resp, "output_text") and resp.output_text:
+        return str(resp.output_text).strip()
+
+    pieces: list[str] = []
+    for item in getattr(resp, "output", []) or []:
+        if getattr(item, "type", None) == "message":
+            for c in getattr(item, "content", []) or []:
+                t = getattr(c, "text", "")
+                if t:
+                    pieces.append(t)
+    return "".join(pieces).strip()
+
+
 def run_single_prompt(prompt: str,
                       model: str = DEFAULT_MODEL,
                       reasoning_effort: str = DEFAULT_EFFORT,
                       max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
-                      system_prompt: str = None) -> str:
+                      system_prompt: str = None,
+                      num_outputs: int = 1,
+                      seeds: Optional[List[Optional[int]]] = None) -> Union[str, List[str]]:
     """Send a single user prompt via Responses API and return plain text output.
 
     Parameters:
@@ -34,8 +53,16 @@ def run_single_prompt(prompt: str,
         system_prompt: Optional system prompt to include.
 
     Returns:
-        Extracted text response.
+        Extracted text response (str if ``num_outputs == 1`` else list[str]).
     """
+    if num_outputs <= 0:
+        raise ValueError("num_outputs must be >= 1")
+
+    if seeds is not None and len(seeds) != num_outputs:
+        raise ValueError("seeds length must match num_outputs")
+
+    seed_list = list(seeds) if seeds is not None else [None] * num_outputs
+
     client = _get_client()
     
     # Build input messages
@@ -44,26 +71,19 @@ def run_single_prompt(prompt: str,
         input_messages.append({"role": "system", "content": system_prompt})
     input_messages.append({"role": "user", "content": prompt})
     
-    resp = client.responses.create(
-        model=model,
-        input=input_messages,
-        reasoning={"effort": reasoning_effort},
-        max_output_tokens=max_output_tokens,
-    )
+    outputs: List[str] = []
+    for seed in seed_list:
+        kwargs = {"seed": seed} if seed is not None else {}
+        resp = client.responses.create(
+            model=model,
+            input=input_messages,
+            reasoning={"effort": reasoning_effort},
+            max_output_tokens=max_output_tokens,
+            **kwargs,
+        )
+        outputs.append(_extract_output_text_from_response(resp))
 
-    # Prefer SDK convenience if present
-    if hasattr(resp, "output_text") and resp.output_text:
-        return resp.output_text.strip()
-
-    # Fallback: traverse structured output
-    pieces: list[str] = []
-    for item in getattr(resp, "output", []) or []:
-        if getattr(item, "type", None) == "message":
-            for c in getattr(item, "content", []) or []:
-                t = getattr(c, "text", "")
-                if t:
-                    pieces.append(t)
-    return "".join(pieces).strip()
+    return outputs[0] if num_outputs == 1 else outputs
 
 
 # ---- Conversation primitives ----
@@ -173,12 +193,18 @@ class Conversation:
         model: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
-    ) -> Union[str, Iterable[str]]:
+        num_outputs: int = 1,
+        seeds: Optional[List[Optional[int]]] = None,
+    ) -> Union[str, Iterable[str], List[str]]:
         """
         Add a user turn, call the model, store the assistant reply, and return it.
 
         If stream=True, returns an iterator of string chunks; the final assembled
         text is added to history automatically once the stream completes.
+
+        When ``num_outputs`` is greater than 1 the call returns a list[str] of
+        completions (non-streaming only) and the first entry is stored on the
+        conversation history.
         """
         # Build message list
         if system_override is not None:
@@ -200,6 +226,8 @@ class Conversation:
         client = _get_client()
 
         if stream:
+            if num_outputs != 1:
+                raise ValueError("streaming with num_outputs>1 is not supported")
             # Streaming via Responses API
             # Collect text chunks as they arrive, then commit to history.
             from contextlib import contextmanager
@@ -232,29 +260,30 @@ class Conversation:
                     self.add_assistant(full)
             return _generator()
 
-        # Non-streaming single-shot
-        resp = client.responses.create(
-            model=use_model,
-            input=base_msgs,
-            reasoning={"effort": use_effort},
-            max_output_tokens=use_max,
-        )
+        if num_outputs <= 0:
+            raise ValueError("num_outputs must be >= 1")
 
-        if hasattr(resp, "output_text") and resp.output_text:
-            text = resp.output_text.strip()
-        else:
-            # fallback traversal (same as your run_single_prompt)
-            chunks: list[str] = []
-            for item in getattr(resp, "output", []) or []:
-                if getattr(item, "type", None) == "message":
-                    for c in getattr(item, "content", []) or []:
-                        t = getattr(c, "text", "")
-                        if t:
-                            chunks.append(t)
-            text = "".join(chunks).strip()
+        if seeds is not None and len(seeds) != num_outputs:
+            raise ValueError("seeds length must match num_outputs")
 
-        self.add_assistant(text)
-        return text
+        seed_list = list(seeds) if seeds is not None else [None] * num_outputs
+
+        responses: List[str] = []
+        for seed in seed_list:
+            kwargs = {"seed": seed} if seed is not None else {}
+            resp = client.responses.create(
+                model=use_model,
+                input=base_msgs,
+                reasoning={"effort": use_effort},
+                max_output_tokens=use_max,
+                **kwargs,
+            )
+            responses.append(_extract_output_text_from_response(resp))
+
+        primary = responses[0]
+        self.add_assistant(primary)
+
+        return primary if num_outputs == 1 else responses
 
 # ---- Tiny convenience wrapper if you like a functional style ----
 

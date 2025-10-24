@@ -54,6 +54,75 @@ def _as_list(x: Union[str, List[str], None], n: int, name: str) -> List[Optional
         return [x] * n
     raise TypeError(f"{name} must be str | list[str] | None")
 
+
+def _broadcast_counts(num_outputs: Union[int, List[int]], n: int, name: str) -> List[int]:
+    """Normalize number-of-variant requests to a list of length ``n``."""
+
+    if isinstance(num_outputs, int):
+        if num_outputs <= 0:
+            raise ValueError(f"{name} must be >= 1")
+        return [int(num_outputs)] * n
+
+    if isinstance(num_outputs, list):
+        if len(num_outputs) != n:
+            raise ValueError(f"{name} length {len(num_outputs)} must match n={n}")
+        counts: List[int] = []
+        for idx, value in enumerate(num_outputs):
+            if not isinstance(value, int):
+                raise TypeError(f"{name}[{idx}] must be int")
+            if value <= 0:
+                raise ValueError(f"{name}[{idx}] must be >= 1")
+            counts.append(int(value))
+        return counts
+
+    raise TypeError(f"{name} must be int | list[int]")
+
+
+def _normalize_seed_grid(
+    seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]],
+    counts: List[int],
+    name: str,
+) -> List[List[Optional[int]]]:
+    """
+    Expand various seed specifications into a grid parallel to ``counts``.
+    Each inner list corresponds to one item and must align with its variant count.
+    """
+
+    if seeds is None:
+        return [[None] * c for c in counts]
+
+    # Single seed broadcast everywhere
+    if isinstance(seeds, int):
+        return [[int(seeds)] * c for c in counts]
+
+    if isinstance(seeds, list):
+        if not seeds:
+            if any(c != 0 for c in counts):
+                raise ValueError(f"{name} cannot be an empty list when completions are requested")
+            return [[] for _ in counts]
+
+        if all(isinstance(s, list) for s in seeds):
+            if len(seeds) != len(counts):
+                raise ValueError(f"{name} length {len(seeds)} must match items={len(counts)}")
+            grid: List[List[Optional[int]]] = []
+            for idx, (sub, count) in enumerate(zip(seeds, counts)):
+                if len(sub) != count:
+                    raise ValueError(
+                        f"{name}[{idx}] length {len(sub)} must match num_outputs={count}"
+                    )
+                grid.append([s if s is None else int(s) for s in sub])
+            return grid
+
+        # Flat list -> broadcast per item; duplicates seeds for each variant of that item
+        if len(seeds) != len(counts):
+            raise ValueError(f"{name} length {len(seeds)} must match items={len(counts)}")
+        grid = []
+        for seed, count in zip(seeds, counts):
+            grid.append([seed if seed is None else int(seed)] * count)
+        return grid
+
+    raise TypeError(f"{name} must be int | list[int|None] | list[list[int|None]] | None")
+
 def _extract_output_text(body: Dict[str, Any]) -> str:
     """
     Extract plain text from Responses API response body (batch shape).
@@ -131,29 +200,60 @@ def _assemble_jsonl_lines(
     max_output_tokens: int,
     run_tag: Optional[str] = None,
     namespace: str = "job",
-) -> Tuple[List[Dict[str, Any]], List[str]]:
+    outputs_per_item: Optional[List[int]] = None,
+    seeds_per_item: Optional[List[List[Optional[int]]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str], List[Tuple[int, int]]]:
     """
-    Build batch input JSONL lines for /v1/responses. Returns (lines, custom_ids).
+    Build batch input JSONL lines for /v1/responses.
+
+    Returns a tuple ``(lines, custom_ids, slot_map)`` where slot_map records
+    ``(item_index, variant_index)`` for each generated custom_id.
     """
+
+    total_items = len(messages_per_item)
+    counts = outputs_per_item or [1] * total_items
+    if len(counts) != total_items:
+        raise ValueError("outputs_per_item length must match messages_per_item")
+
+    seeds_grid = seeds_per_item or [[None] * c for c in counts]
+    if len(seeds_grid) != total_items:
+        raise ValueError("seeds_per_item length must match messages_per_item")
+
+    for idx, (seed_row, count) in enumerate(zip(seeds_grid, counts)):
+        if len(seed_row) != count:
+            raise ValueError(
+                f"seeds_per_item[{idx}] length {len(seed_row)} must match outputs_per_item={count}"
+            )
+
     lines: List[Dict[str, Any]] = []
     custom_ids: List[str] = []
+    slot_map: List[Tuple[int, int]] = []
     run_tag = run_tag or uuid.uuid4().hex[:10]
+
     for idx, msgs in enumerate(messages_per_item):
-        custom_id = f"{namespace}::{run_tag}::{idx}"
-        body = {
-            "model": model,
-            "input": msgs,
-            "reasoning": {"effort": reasoning_effort},
-            "max_output_tokens": int(max_output_tokens),
-        }
-        lines.append({
-            "custom_id": custom_id,
-            "method": "POST",
-            "url": "/v1/responses",
-            "body": body,
-        })
-        custom_ids.append(custom_id)
-    return lines, custom_ids
+        count = counts[idx]
+        seed_row = seeds_grid[idx]
+        for variant_idx in range(count):
+            suffix = f"::v{variant_idx}" if count > 1 else ""
+            custom_id = f"{namespace}::{run_tag}::{idx}{suffix}"
+            body: Dict[str, Any] = {
+                "model": model,
+                "input": msgs,
+                "reasoning": {"effort": reasoning_effort},
+                "max_output_tokens": int(max_output_tokens),
+            }
+            seed_value = seed_row[variant_idx]
+            if seed_value is not None:
+                body["seed"] = int(seed_value)
+            lines.append({
+                "custom_id": custom_id,
+                "method": "POST",
+                "url": "/v1/responses",
+                "body": body,
+            })
+            custom_ids.append(custom_id)
+            slot_map.append((idx, variant_idx))
+    return lines, custom_ids, slot_map
 
 def _run_batch_and_collect(
     lines: List[Dict[str, Any]],
@@ -196,14 +296,23 @@ def batch_single_prompt(
     completion_window: str = DEFAULT_COMPLETION_WINDOW,
     run_tag: Optional[str] = None,
     verbose: bool = True,
-) -> List[str]:
+    num_outputs: Union[int, List[int]] = 1,
+    seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
+) -> Union[List[str], List[List[str]]]:
     """
     Submit one or many prompts as a single batch job.
-    Always returns a list of assistant strings in the same order as inputs.
+
+    Returns
+    -------
+    list[str] when every prompt requests a single completion, otherwise a
+    list[list[str]] where each sub-list contains the completions for that input
+    prompt in order.
     """
     items = prompts if isinstance(prompts, list) else [prompts]
     n = len(items)
     systems = _as_list(system_prompt, n, "system_prompt")
+    counts = _broadcast_counts(num_outputs, n, "num_outputs")
+    seeds_grid = _normalize_seed_grid(seeds, counts, "seeds")
 
     messages_per_item: List[List[Dict[str, str]]] = []
     for i in range(n):
@@ -213,13 +322,15 @@ def batch_single_prompt(
         msgs.append({"role": "user", "content": items[i]})
         messages_per_item.append(msgs)
 
-    lines, custom_ids = _assemble_jsonl_lines(
+    lines, custom_ids, slot_map = _assemble_jsonl_lines(
         messages_per_item=messages_per_item,
         model=model,
         reasoning_effort=reasoning_effort,
         max_output_tokens=max_output_tokens,
         run_tag=run_tag,
         namespace="single",
+        outputs_per_item=counts,
+        seeds_per_item=seeds_grid,
     )
     out_records = _run_batch_and_collect(lines, completion_window, verbose=verbose)
 
@@ -233,7 +344,16 @@ def batch_single_prompt(
             raise RuntimeError(f"Non-200 for {cid}: {status}")
         outputs[cid] = _extract_output_text(body)
 
-    return [outputs[cid] for cid in custom_ids]
+    collected: List[List[str]] = [[""] * count for count in counts]
+    for cid, (item_idx, variant_idx) in zip(custom_ids, slot_map):
+        if cid not in outputs:
+            raise KeyError(f"Missing output for custom_id {cid}")
+        collected[item_idx][variant_idx] = outputs[cid]
+
+    all_single = all(count == 1 for count in counts)
+    if all_single:
+        return [row[0] for row in collected]
+    return [list(row) for row in collected]
 
 # ----------------- Public: batched conversation -----------------
 
@@ -331,14 +451,27 @@ class BatchConversation:
         return [[t.to_msg() for t in thread] for thread in self._threads]
 
     # ---- main ops ----
-    def ask(self, user_prompts: Union[str, List[str]], *, verbose: bool = True) -> List[str]:
+    def ask(
+        self,
+        user_prompts: Union[str, List[str]],
+        *,
+        verbose: bool = True,
+        num_outputs: Union[int, List[int]] = 1,
+        seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
+    ) -> Union[List[str], List[List[str]]]:
         """
         Add a user turn (broadcast or list) across threads, submit a batch,
-        append assistant replies, and return the replies (list[str]).
+        append assistant replies, and return the replies.
+
+        When ``num_outputs`` requests more than one completion for any thread the
+        returned structure becomes ``List[List[str]]`` (one list per thread).
         """
         prompts = user_prompts if isinstance(user_prompts, list) else [user_prompts] * self.count
         if len(prompts) != self.count:
             raise ValueError(f"user_prompts length {len(prompts)} must match count={self.count}")
+
+        counts = _broadcast_counts(num_outputs, self.count, "num_outputs")
+        seeds_grid = _normalize_seed_grid(seeds, counts, "seeds")
 
         now = time.time()
         for i in range(self.count):
@@ -349,13 +482,15 @@ class BatchConversation:
             messages_per_item.append([t.to_msg() for t in self._threads[i]])
 
         ns = f"conv::step{self.step}"
-        lines, custom_ids = _assemble_jsonl_lines(
+        lines, custom_ids, slot_map = _assemble_jsonl_lines(
             messages_per_item=messages_per_item,
             model=self.model,
             reasoning_effort=self.reasoning_effort,
             max_output_tokens=self.max_output_tokens,
             run_tag=self.run_tag,
             namespace=ns,
+            outputs_per_item=counts,
+            seeds_per_item=seeds_grid,
         )
         out_records = _run_batch_and_collect(lines, self.completion_window, verbose=verbose)
 
@@ -369,22 +504,38 @@ class BatchConversation:
                 raise RuntimeError(f"Non-200 for {cid}: {status}")
             by_id[cid] = _extract_output_text(body)
 
-        replies: List[str] = []
-        for cid in custom_ids:
-            replies.append(by_id[cid])
+        collected: List[List[str]] = [[""] * count for count in counts]
+        for cid, (thread_idx, variant_idx) in zip(custom_ids, slot_map):
+            if cid not in by_id:
+                raise KeyError(f"Missing output for custom_id {cid}")
+            collected[thread_idx][variant_idx] = by_id[cid]
+
+        primary = [row[0] for row in collected]
 
         now2 = time.time()
         for i in range(self.count):
-            self._threads[i].append(_Turn("assistant", replies[i], now2))
+            self._threads[i].append(_Turn("assistant", primary[i], now2))
 
         self.step += 1
-        return replies
+        all_single = all(count == 1 for count in counts)
+        if all_single:
+            return primary
+        return [list(row) for row in collected]
 
-    def ask_masked(self, user_prompts_masked: List[Optional[str]], *, verbose: bool = True) -> List[Optional[str]]:
+    def ask_masked(
+        self,
+        user_prompts_masked: List[Optional[str]],
+        *,
+        verbose: bool = True,
+        num_outputs: Union[int, List[int]] = 1,
+        seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
+    ) -> List[Optional[Union[str, List[str]]]]:
         """
         Add a user turn for *selected* threads only (None = skip that thread),
         submit one batch containing just the active threads, and return a list
         of replies aligned to thread indices (None where skipped).
+
+        Threads requesting more than one completion return a ``List[str]`` entry.
         """
         if len(user_prompts_masked) != self.count:
             raise ValueError(f"user_prompts_masked length {len(user_prompts_masked)} must match count={self.count}")
@@ -398,9 +549,14 @@ class BatchConversation:
         for i in active_indices:
             self._threads[i].append(_Turn("user", user_prompts_masked[i] or "", now))
 
+        per_thread_counts = _broadcast_counts(num_outputs, self.count, "num_outputs")
+        per_thread_seeds = _normalize_seed_grid(seeds, per_thread_counts, "seeds")
+
+        active_counts = [per_thread_counts[i] for i in active_indices]
+        active_seeds = [per_thread_seeds[i] for i in active_indices]
+
         # Build payload only for active threads
         messages_per_item: List[List[Dict[str, str]]] = []
-        id2slot: Dict[str, int] = {}  # custom_id -> thread index
         ns = f"conv::step{self.step}"
 
         # Assemble lines *in active order*; track mapping to thread index
@@ -408,22 +564,23 @@ class BatchConversation:
             msgs = [t.to_msg() for t in self._threads[i]]
             messages_per_item.append(msgs)
 
-        lines, custom_ids = _assemble_jsonl_lines(
+        lines, custom_ids, slot_map = _assemble_jsonl_lines(
             messages_per_item=messages_per_item,
             model=self.model,
             reasoning_effort=self.reasoning_effort,
             max_output_tokens=self.max_output_tokens,
             run_tag=self.run_tag,
             namespace=ns,
+            outputs_per_item=active_counts,
+            seeds_per_item=active_seeds,
         )
-        # Map back each custom_id to its thread index
-        for slot, cid in zip(active_indices, custom_ids):
-            id2slot[cid] = slot
-
         out_records = _run_batch_and_collect(lines, self.completion_window, verbose=verbose)
 
-        # Collect outputs
-        slot_to_reply: Dict[int, str] = {}
+        # Collect outputs mapped back to thread index and variant slot
+        slot_to_reply: Dict[int, List[str]] = {
+            idx: [""] * per_thread_counts[idx] for idx in active_indices
+        }
+        slot_lookup = {cid: slot for cid, slot in zip(custom_ids, slot_map)}
         for r in out_records:
             cid = r.get("custom_id")
             resp = (r.get("response") or {})
@@ -431,24 +588,38 @@ class BatchConversation:
             body = resp.get("body") or {}
             if status != 200:
                 raise RuntimeError(f"Non-200 for {cid}: {status}")
-            slot = id2slot[cid]
-            slot_to_reply[slot] = _extract_output_text(body)
+            if cid not in slot_lookup:
+                raise KeyError(f"Unexpected custom_id {cid} in batch output")
+            slot_idx, variant_idx = slot_lookup[cid]
+            thread_idx = active_indices[slot_idx]
+            slot_to_reply[thread_idx][variant_idx] = _extract_output_text(body)
 
         # Append assistant turns for active threads
         now2 = time.time()
         for i in active_indices:
-            reply = slot_to_reply[i]
+            reply = slot_to_reply[i][0]
             self._threads[i].append(_Turn("assistant", reply, now2))
 
         # Build aligned result (None where skipped)
-        out: List[Optional[str]] = [None] * self.count
+        out: List[Optional[Union[str, List[str]]]] = [None] * self.count
         for i in active_indices:
-            out[i] = slot_to_reply[i]
+            variants = slot_to_reply[i]
+            if len(variants) == 1:
+                out[i] = variants[0]
+            else:
+                out[i] = list(variants)
 
         self.step += 1
         return out
 
-    def ask_map(self, prompt_map: Dict[int, str], *, verbose: bool = True) -> Dict[int, str]:
+    def ask_map(
+        self,
+        prompt_map: Dict[int, str],
+        *,
+        verbose: bool = True,
+        num_outputs: Union[int, List[int]] = 1,
+        seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
+    ) -> Dict[int, Union[str, List[str]]]:
         """
         Convenience wrapper: provide {thread_index: prompt}. Returns {thread_index: reply}.
         """
@@ -457,5 +628,10 @@ class BatchConversation:
             if i < 0 or i >= self.count:
                 raise IndexError(f"thread index out of range: {i}")
             masked[i] = p
-        replies = self.ask_masked(masked, verbose=verbose)
-        return {i: (replies[i] or "") for i in prompt_map.keys()}
+        replies = self.ask_masked(
+            masked,
+            verbose=verbose,
+            num_outputs=num_outputs,
+            seeds=seeds,
+        )
+        return {i: (replies[i] if replies[i] is not None else "") for i in prompt_map.keys()}
