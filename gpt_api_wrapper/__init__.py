@@ -13,6 +13,7 @@ from gpt_api_wrapper.openai_wrapper import (
     DEFAULT_MODEL,
     DEFAULT_EFFORT,
     DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_PROVIDER,
 )
 
 from gpt_api_wrapper.openai_wrapper_batch import (
@@ -20,6 +21,8 @@ from gpt_api_wrapper.openai_wrapper_batch import (
     BatchConversation,
     DEFAULT_COMPLETION_WINDOW,
 )
+
+from gpt_api_wrapper.providers import available_providers
 
 __all__ = [
     # Single-shot operations
@@ -36,7 +39,9 @@ __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_EFFORT",
     "DEFAULT_MAX_OUTPUT_TOKENS",
+    "DEFAULT_PROVIDER",
     "DEFAULT_COMPLETION_WINDOW",
+    "available_providers",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
