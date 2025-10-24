@@ -1,13 +1,13 @@
 # GPT API Wrapper
 
-A lightweight Python library providing simple wrappers around the OpenAI Responses API. This package supports both single-shot prompts and batched operations with conversation history management.
+A lightweight Python library providing simple wrappers around multiple LLM providers (OpenAI, Anthropic Claude, xAI Grok, and Google Gemini). This package supports both single-shot prompts and batched operations with conversation history management.
 
 ## Features
 
 - **Single-shot prompts**: Send individual prompts and get responses
 - **Conversation management**: Maintain multi-turn conversations with automatic history tracking
-- **Batch operations**: Process multiple prompts efficiently using OpenAI's Batch API
-- **Batched conversations**: Run parallel conversation threads in batch mode
+- **Batch operations**: Process multiple prompts efficiently using OpenAI's Batch API or provider fallbacks
+- **Batched conversations**: Run parallel conversation threads in batch mode across all providers
 - **Streaming support**: Stream responses in real-time for single conversations
 - **Persistence**: Save and load conversation histories
 
@@ -41,20 +41,36 @@ pip install "git+ssh://git@github.com/spsanps/gpt-api-wrapper.git@<tag-or-commit
 ### Requirements
 
 - Python 3.9 or newer
-- `openai` package (automatically installed)
+- `openai`, `anthropic`, `xai-sdk`, `google-genai`, and `tqdm` packages (automatically installed)
 
 ### Environment Setup
 
-Set your OpenAI API key as an environment variable:
+Configure the credentials for the providers you intend to use. Each provider reads its API key from an environment variable.
+
+#### OpenAI
 
 ```bash
 export OPENAI_API_KEY="your-api-key-here"
+export OPENAI_BASE_URL="https://custom-endpoint.example.com"  # optional
 ```
 
-Optionally, set a custom base URL:
+#### Anthropic Claude
 
 ```bash
-export OPENAI_BASE_URL="https://custom-endpoint.example.com"
+export ANTHROPIC_API_KEY="your-api-key-here"
+```
+
+#### xAI Grok
+
+```bash
+export XAI_API_KEY="your-api-key-here"
+export XAI_BASE_URL="https://api.x.ai/v1"  # optional override
+```
+
+#### Google Gemini
+
+```bash
+export GOOGLE_API_KEY="your-api-key-here"  # or GEMINI_API_KEY
 ```
 
 ## Usage
@@ -64,15 +80,18 @@ export OPENAI_BASE_URL="https://custom-endpoint.example.com"
 Send a single prompt and get a response:
 
 ```python
-from gpt_api_wrapper import run_single_prompt
+from gpt_api_wrapper import run_single_prompt, available_providers
 
 response = run_single_prompt(
     "Explain transformers in 2 lines",
     model="gpt-5-mini",
     reasoning_effort="medium",
-    system_prompt="You are a concise assistant."
+    system_prompt="You are a concise assistant.",
+    provider="openai",  # or "anthropic", "xai", "gemini"
 )
 print(response)
+
+print("Providers:", available_providers())
 ```
 
 ### Conversation Management
@@ -87,7 +106,8 @@ convo = Conversation(
     system_prompt="You are a helpful coding assistant.",
     model="gpt-5-mini",
     reasoning_effort="medium",
-    max_turns=32  # Keep last 32 turns in history
+    max_turns=32,  # Keep last 32 turns in history
+    provider="anthropic"
 )
 
 # Ask questions
@@ -112,7 +132,7 @@ Stream responses in real-time:
 ```python
 from gpt_api_wrapper import Conversation
 
-convo = Conversation(system_prompt="You are a helpful assistant.")
+convo = Conversation(system_prompt="You are a helpful assistant.")  # streaming currently supported for OpenAI and Anthropic
 
 # Stream the response
 for chunk in convo.ask("Tell me a story", stream=True):
@@ -138,7 +158,8 @@ responses = batch_single_prompt(
     prompts=prompts,
     system_prompt="You are a concise assistant.",
     model="gpt-5-mini",
-    reasoning_effort="medium"
+    reasoning_effort="medium",
+    provider="openai",
 )
 
 for i, response in enumerate(responses):
@@ -156,7 +177,8 @@ from gpt_api_wrapper import BatchConversation
 batch_convo = BatchConversation(
     count=3,
     system_prompt="You are a helpful assistant.",
-    model="gpt-5-mini"
+    model="gpt-5-mini",
+    provider="gemini"
 )
 
 # First turn - different prompts for each thread
@@ -183,7 +205,7 @@ batch_convo2 = BatchConversation.load("batch_conversations.json")
 
 ### Single Operations
 
-#### `run_single_prompt(prompt, model, reasoning_effort, max_output_tokens, system_prompt)`
+#### `run_single_prompt(prompt, model, reasoning_effort, max_output_tokens, system_prompt, provider)`
 
 Send a single prompt and return the response.
 
@@ -193,6 +215,7 @@ Send a single prompt and return the response.
 - `reasoning_effort` (str): One of "low", "medium", "high" (default: "medium")
 - `max_output_tokens` (int): Maximum tokens in response (default: 16384)
 - `system_prompt` (str, optional): System prompt
+- `provider` (str): Provider name (default: "openai")
 
 **Returns:** str - The model's response
 
@@ -206,6 +229,7 @@ Multi-turn conversation manager.
 - `reasoning_effort` (str): Reasoning effort level (default: "medium")
 - `max_output_tokens` (int): Maximum tokens per response (default: 16384)
 - `max_turns` (int): Maximum conversation turns to keep in history (default: 32)
+- `provider` (str): Provider name (default: "openai")
 
 **Methods:**
 - `ask(user_text, stream=False, **kwargs)`: Send a message and get a response
@@ -217,9 +241,11 @@ Multi-turn conversation manager.
 
 ### Batch Operations
 
-#### `batch_single_prompt(prompts, system_prompt, model, reasoning_effort, max_output_tokens, completion_window, verbose)`
+#### `batch_single_prompt(prompts, system_prompt, model, reasoning_effort, max_output_tokens, completion_window, verbose, provider)`
 
 Process multiple prompts in a single batch job.
+
+For providers without a native batch API (e.g., Anthropic, xAI, Gemini), the wrapper transparently falls back to sequential execution with progress reporting via `tqdm`.
 
 **Parameters:**
 - `prompts` (str | list[str]): Single prompt or list of prompts
@@ -229,6 +255,7 @@ Process multiple prompts in a single batch job.
 - `max_output_tokens` (int): Maximum tokens per response (default: 16384)
 - `completion_window` (str): Batch completion window (default: "24h")
 - `verbose` (bool): Print batch status updates (default: True)
+- `provider` (str): Provider name (default: "openai")
 
 **Returns:** list[str] - Responses in the same order as inputs
 
@@ -243,6 +270,7 @@ Maintain multiple parallel conversation threads processed in batch mode.
 - `reasoning_effort` (str): Reasoning effort (default: "medium")
 - `max_output_tokens` (int): Maximum tokens per response (default: 16384)
 - `completion_window` (str): Batch completion window (default: "24h")
+- `provider` (str): Provider name (default: "openai")
 
 **Methods:**
 - `ask(user_prompts, verbose=True)`: Send message(s) to all threads and get responses
