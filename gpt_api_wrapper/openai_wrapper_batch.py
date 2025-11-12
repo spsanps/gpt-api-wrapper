@@ -286,6 +286,70 @@ def _run_batch_and_collect(
 
 # ----------------- Public: basic batch -----------------
 
+def recover_batch_result(
+    batch_id: str,
+    *,
+    poll_interval: float = 5.0,
+    verbose: bool = True,
+) -> Dict[str, str]:
+    """
+    Recover the output from a batch job by its ID.
+    
+    Polls until the batch completes (if still running) and returns a dictionary
+    mapping custom_id to extracted text response. Useful if you lost connection
+    or need to retrieve results later.
+    
+    Parameters
+    ----------
+    batch_id : str
+        The batch job ID to recover
+    poll_interval : float
+        Seconds between status checks (default: 5.0)
+    verbose : bool
+        Print status updates (default: True)
+        
+    Returns
+    -------
+    dict[str, str]
+        Dictionary mapping custom_id to extracted text response
+        
+    Raises
+    ------
+    RuntimeError
+        If the batch failed or output file is missing
+    """
+    final = _poll_for_completion(batch_id, poll_interval=poll_interval, verbose=verbose)
+    
+    if getattr(final, "status", None) != "completed":
+        err_id = getattr(final, "error_file_id", None) or getattr(final, "errors_file_id", None)
+        if err_id:
+            errs = _download_output_file(err_id)
+            raise RuntimeError(f"Batch failed with status={final.status}. Errors: {errs[:3]}")
+        raise RuntimeError(f"Batch finished with status={final.status}")
+    
+    out_id = getattr(final, "output_file_id", None)
+    if not out_id:
+        raise RuntimeError("Completed batch missing output_file_id")
+    
+    out_records = _download_output_file(out_id)
+    
+    # Extract text responses from records
+    results: Dict[str, str] = {}
+    for r in out_records:
+        cid = r.get("custom_id")
+        resp = (r.get("response") or {})
+        status = resp.get("status_code")
+        body = resp.get("body") or {}
+        if status != 200:
+            if verbose:
+                print(f"[warning] Non-200 status for {cid}: {status}")
+            results[cid] = f"ERROR: HTTP {status}"
+        else:
+            results[cid] = _extract_output_text(body)
+    
+    return results
+
+
 def batch_single_prompt(
     prompts: Union[str, List[str]],
     system_prompt: Optional[Union[str, List[str]]] = None,
@@ -635,3 +699,76 @@ class BatchConversation:
             seeds=seeds,
         )
         return {i: (replies[i] if replies[i] is not None else "") for i in prompt_map.keys()}
+
+    def recover_and_apply(
+        self,
+        batch_id: str,
+        user_prompts: Union[str, List[str]],
+        *,
+        poll_interval: float = 5.0,
+        verbose: bool = True,
+    ) -> List[str]:
+        """
+        Recover a batch result and apply it to conversation history.
+        
+        Use this if you submitted a batch but lost the results. You must provide
+        the same user_prompts that were originally sent so they can be added to
+        the conversation history before the assistant responses.
+        
+        Parameters
+        ----------
+        batch_id : str
+            The batch job ID to recover
+        user_prompts : str | list[str]
+            The user prompts that were sent (must match count)
+        poll_interval : float
+            Seconds between status checks
+        verbose : bool
+            Print status updates
+            
+        Returns
+        -------
+        list[str]
+            The assistant replies (one per thread)
+            
+        Notes
+        -----
+        This assumes the batch was created with a single output per thread.
+        The step counter is incremented.
+        """
+        prompts = user_prompts if isinstance(user_prompts, list) else [user_prompts] * self.count
+        if len(prompts) != self.count:
+            raise ValueError(f"user_prompts length {len(prompts)} must match count={self.count}")
+        
+        # Recover batch output - now returns Dict[str, str] mapping custom_id to text
+        results_by_cid = recover_batch_result(batch_id, poll_interval=poll_interval, verbose=verbose)
+        
+        # Parse custom_ids to extract thread indices and build reply mapping
+        by_thread: Dict[int, str] = {}
+        for cid, text in results_by_cid.items():
+            # Parse custom_id format: "conv::stepX::run_tag::thread_idx" or similar
+            parts = cid.split("::")
+            if len(parts) >= 4:
+                try:
+                    # Format is namespace::stepX::run_tag::thread_idx
+                    thread_idx_str = parts[3].replace("v", "").split("v")[0]
+                    thread_idx = int(thread_idx_str)
+                    by_thread[thread_idx] = text
+                except (ValueError, IndexError):
+                    raise ValueError(f"Cannot parse thread index from custom_id: {cid}")
+            else:
+                raise ValueError(f"Unexpected custom_id format: {cid}")
+        
+        if len(by_thread) != self.count:
+            raise RuntimeError(f"Expected {self.count} responses, got {len(by_thread)}")
+        
+        # Add user and assistant turns to history
+        now = time.time()
+        for i in range(self.count):
+            if i not in by_thread:
+                raise KeyError(f"Missing response for thread {i}")
+            self._threads[i].append(_Turn("user", prompts[i], now))
+            self._threads[i].append(_Turn("assistant", by_thread[i], now))
+        
+        self.step += 1
+        return [by_thread[i] for i in range(self.count)]

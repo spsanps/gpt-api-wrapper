@@ -17,6 +17,7 @@ from gpt_api_wrapper.openai_wrapper import (
 
 from gpt_api_wrapper.openai_wrapper_batch import (
     batch_single_prompt,
+    recover_batch_result,
     BatchConversation,
     DEFAULT_COMPLETION_WINDOW,
 )
@@ -31,6 +32,8 @@ __all__ = [
     # Batch operations
     "batch_single_prompt",
     "BatchConversation",
+    
+    "recover_batch_result",
 
     # Constants
     "DEFAULT_MODEL",
