@@ -21,6 +21,7 @@ import io
 import time
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 
@@ -522,13 +523,22 @@ class BatchConversation:
         verbose: bool = True,
         num_outputs: Union[int, List[int]] = 1,
         seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
+        use_batch: bool = True,
+        max_workers: Optional[int] = None,
     ) -> Union[List[str], List[List[str]]]:
         """
-        Add a user turn (broadcast or list) across threads, submit a batch,
-        append assistant replies, and return the replies.
+        Add a user turn (broadcast or list) across threads, submit a batch or make
+        synchronous calls, append assistant replies, and return the replies.
 
         When ``num_outputs`` requests more than one completion for any thread the
         returned structure becomes ``List[List[str]]`` (one list per thread).
+        
+        Parameters
+        ----------
+        use_batch : bool
+            If True (default), use batch API. If False, make synchronous calls in parallel.
+        max_workers : int, optional
+            Maximum number of parallel workers for synchronous mode. Defaults to None (uses ThreadPoolExecutor default).
         """
         prompts = user_prompts if isinstance(user_prompts, list) else [user_prompts] * self.count
         if len(prompts) != self.count:
@@ -540,6 +550,69 @@ class BatchConversation:
         now = time.time()
         for i in range(self.count):
             self._threads[i].append(_Turn("user", prompts[i], now))
+
+        if not use_batch:
+            # Synchronous mode with parallel execution
+            client = _get_client()
+            collected: List[List[str]] = [[] for _ in range(self.count)]
+            
+            def make_completion(thread_idx: int, variant_idx: int) -> Tuple[int, int, str]:
+                """Helper to make a single completion call."""
+                messages = [t.to_msg() for t in self._threads[thread_idx]]
+                thread_seeds = seeds_grid[thread_idx]
+                
+                kwargs: Dict[str, Any] = {
+                    "model": self.model,
+                    "messages": messages,
+                    "max_completion_tokens": self.max_output_tokens,
+                }
+                
+                # Add reasoning_effort if model supports it (o1/o3 models)
+                kwargs["reasoning_effort"] = self.reasoning_effort
+                
+                seed_value = thread_seeds[variant_idx]
+                if seed_value is not None:
+                    kwargs["seed"] = int(seed_value)
+                
+                if verbose:
+                    print(f"[sync] thread {thread_idx}, variant {variant_idx}")
+                
+                response = client.chat.completions.create(**kwargs)
+                text = response.choices[0].message.content or ""
+                return thread_idx, variant_idx, text.strip()
+            
+            # Build list of all completion tasks
+            tasks = []
+            for i in range(self.count):
+                for variant_idx in range(counts[i]):
+                    tasks.append((i, variant_idx))
+            
+            # Execute all tasks in parallel
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(make_completion, thread_idx, variant_idx): (thread_idx, variant_idx)
+                    for thread_idx, variant_idx in tasks
+                }
+                
+                for future in as_completed(futures):
+                    thread_idx, variant_idx, text = future.result()
+                    collected[thread_idx].append(text)
+            
+            # Ensure results are in correct order (variants per thread)
+            for i in range(self.count):
+                if len(collected[i]) != counts[i]:
+                    raise RuntimeError(f"Thread {i}: expected {counts[i]} variants, got {len(collected[i])}")
+            
+            primary = [row[0] for row in collected]
+            now2 = time.time()
+            for i in range(self.count):
+                self._threads[i].append(_Turn("assistant", primary[i], now2))
+            
+            self.step += 1
+            all_single = all(count == 1 for count in counts)
+            if all_single:
+                return primary
+            return [list(row) for row in collected]
 
         messages_per_item: List[List[Dict[str, str]]] = []
         for i in range(self.count):
@@ -556,7 +629,7 @@ class BatchConversation:
             outputs_per_item=counts,
             seeds_per_item=seeds_grid,
         )
-        out_records = _run_batch_and_collect(lines, self.completion_window, verbose=verbose)
+        out_records = _run_batch_and_collect(lines, completion_window, verbose=verbose)
 
         by_id: Dict[str, str] = {}
         for r in out_records:
