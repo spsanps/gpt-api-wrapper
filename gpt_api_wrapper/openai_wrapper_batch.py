@@ -518,46 +518,70 @@ class BatchConversation:
     # ---- main ops ----
     def ask(
         self,
-        user_prompts: Union[str, List[str]],
+        user_prompts: Union[str, List[Optional[str]]],
         *,
         verbose: bool = True,
         num_outputs: Union[int, List[int]] = 1,
         seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
         use_batch: bool = True,
         max_workers: Optional[int] = None,
-    ) -> Union[List[str], List[List[str]]]:
+    ) -> Union[List[Optional[str]], List[Optional[List[str]]]]:
         """
-        Add a user turn (broadcast or list) across threads, submit a batch or make
-        synchronous calls, append assistant replies, and return the replies.
+        Add a user turn across threads, submit a batch or make synchronous calls,
+        append assistant replies, and return the replies.
+
+        User prompts can be:
+        - A single string (broadcast to all threads)
+        - A list with string values (one per thread)
+        - A list with Optional[str] values (None = skip that thread this step)
 
         When ``num_outputs`` requests more than one completion for any thread the
-        returned structure becomes ``List[List[str]]`` (one list per thread).
+        returned structure becomes ``List[Optional[List[str]]]`` (one list per active thread,
+        None for skipped threads).
         
         Parameters
         ----------
+        user_prompts : str | list[str | None]
+            User prompt(s). Use None in list to skip a thread.
         use_batch : bool
             If True (default), use batch API. If False, make synchronous calls in parallel.
         max_workers : int, optional
-            Maximum number of parallel workers for synchronous mode. Defaults to None (uses ThreadPoolExecutor default).
+            Maximum number of parallel workers for synchronous mode.
+        
+        Returns
+        -------
+        list[str | None] or list[list[str] | None]
+            Replies aligned to thread indices (None where skipped).
         """
-        prompts = user_prompts if isinstance(user_prompts, list) else [user_prompts] * self.count
+        # Convert to list format
+        if isinstance(user_prompts, str):
+            prompts: List[Optional[str]] = [user_prompts] * self.count
+        else:
+            prompts = user_prompts
+            
         if len(prompts) != self.count:
             raise ValueError(f"user_prompts length {len(prompts)} must match count={self.count}")
+
+        # Determine active threads
+        active_indices = [i for i, p in enumerate(prompts) if p is not None]
+        if not active_indices:
+            return [None] * self.count  # no-op step, no increment
 
         counts = _broadcast_counts(num_outputs, self.count, "num_outputs")
         seeds_grid = _normalize_seed_grid(seeds, counts, "seeds")
 
         now = time.time()
-        for i in range(self.count):
-            self._threads[i].append(_Turn("user", prompts[i], now))
+        for i in active_indices:
+            self._threads[i].append(_Turn("user", prompts[i] or "", now))
 
         if not use_batch:
             # Synchronous mode with parallel execution
             client = _get_client()
-            collected: List[List[str]] = [[] for _ in range(self.count)]
+            collected: List[List[str]] = [[] for _ in active_indices]
             
-            def make_completion(thread_idx: int, variant_idx: int) -> Tuple[int, int, str]:
+            def make_completion(active_idx: int, variant_idx: int) -> Tuple[int, int, str]:
                 """Helper to make a single completion call."""
+                thread_idx = active_indices[active_idx]
                 messages = [t.to_msg() for t in self._threads[thread_idx]]
                 thread_seeds = seeds_grid[thread_idx]
                 
@@ -567,7 +591,6 @@ class BatchConversation:
                     "max_completion_tokens": self.max_output_tokens,
                 }
                 
-                # Add reasoning_effort if model supports it (o1/o3 models)
                 kwargs["reasoning_effort"] = self.reasoning_effort
                 
                 seed_value = thread_seeds[variant_idx]
@@ -579,128 +602,59 @@ class BatchConversation:
                 
                 response = client.chat.completions.create(**kwargs)
                 text = response.choices[0].message.content or ""
-                return thread_idx, variant_idx, text.strip()
+                return active_idx, variant_idx, text.strip()
             
             # Build list of all completion tasks
             tasks = []
-            for i in range(self.count):
-                for variant_idx in range(counts[i]):
-                    tasks.append((i, variant_idx))
+            for active_idx in range(len(active_indices)):
+                thread_idx = active_indices[active_idx]
+                for variant_idx in range(counts[thread_idx]):
+                    tasks.append((active_idx, variant_idx))
             
             # Execute all tasks in parallel
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(make_completion, thread_idx, variant_idx): (thread_idx, variant_idx)
-                    for thread_idx, variant_idx in tasks
+                    executor.submit(make_completion, active_idx, variant_idx): (active_idx, variant_idx)
+                    for active_idx, variant_idx in tasks
                 }
                 
                 for future in as_completed(futures):
-                    thread_idx, variant_idx, text = future.result()
-                    collected[thread_idx].append(text)
+                    active_idx, variant_idx, text = future.result()
+                    collected[active_idx].append(text)
             
-            # Ensure results are in correct order (variants per thread)
-            for i in range(self.count):
-                if len(collected[i]) != counts[i]:
-                    raise RuntimeError(f"Thread {i}: expected {counts[i]} variants, got {len(collected[i])}")
+            # Ensure results are in correct order
+            for active_idx in range(len(active_indices)):
+                thread_idx = active_indices[active_idx]
+                if len(collected[active_idx]) != counts[thread_idx]:
+                    raise RuntimeError(f"Thread {thread_idx}: expected {counts[thread_idx]} variants, got {len(collected[active_idx])}")
             
-            primary = [row[0] for row in collected]
+            # Append assistant turns
             now2 = time.time()
-            for i in range(self.count):
-                self._threads[i].append(_Turn("assistant", primary[i], now2))
+            for active_idx, thread_idx in enumerate(active_indices):
+                primary_reply = collected[active_idx][0]
+                self._threads[thread_idx].append(_Turn("assistant", primary_reply, now2))
+            
+            # Build aligned result
+            out: List[Optional[Union[str, List[str]]]] = [None] * self.count
+            for active_idx, thread_idx in enumerate(active_indices):
+                variants = collected[active_idx]
+                if counts[thread_idx] == 1:
+                    out[thread_idx] = variants[0]
+                else:
+                    out[thread_idx] = list(variants)
             
             self.step += 1
-            all_single = all(count == 1 for count in counts)
-            if all_single:
-                return primary
-            return [list(row) for row in collected]
+            return out
+
+        # Batch mode - build payload only for active threads
+        active_counts = [counts[i] for i in active_indices]
+        active_seeds = [seeds_grid[i] for i in active_indices]
 
         messages_per_item: List[List[Dict[str, str]]] = []
-        for i in range(self.count):
+        for i in active_indices:
             messages_per_item.append([t.to_msg() for t in self._threads[i]])
 
         ns = f"conv::step{self.step}"
-        lines, custom_ids, slot_map = _assemble_jsonl_lines(
-            messages_per_item=messages_per_item,
-            model=self.model,
-            reasoning_effort=self.reasoning_effort,
-            max_output_tokens=self.max_output_tokens,
-            run_tag=self.run_tag,
-            namespace=ns,
-            outputs_per_item=counts,
-            seeds_per_item=seeds_grid,
-        )
-        out_records = _run_batch_and_collect(lines, completion_window, verbose=verbose)
-
-        by_id: Dict[str, str] = {}
-        for r in out_records:
-            cid = r.get("custom_id")
-            resp = (r.get("response") or {})
-            status = resp.get("status_code")
-            body = resp.get("body") or {}
-            if status != 200:
-                raise RuntimeError(f"Non-200 for {cid}: {status}")
-            by_id[cid] = _extract_output_text(body)
-
-        collected: List[List[str]] = [[""] * count for count in counts]
-        for cid, (thread_idx, variant_idx) in zip(custom_ids, slot_map):
-            if cid not in by_id:
-                raise KeyError(f"Missing output for custom_id {cid}")
-            collected[thread_idx][variant_idx] = by_id[cid]
-
-        primary = [row[0] for row in collected]
-
-        now2 = time.time()
-        for i in range(self.count):
-            self._threads[i].append(_Turn("assistant", primary[i], now2))
-
-        self.step += 1
-        all_single = all(count == 1 for count in counts)
-        if all_single:
-            return primary
-        return [list(row) for row in collected]
-
-    def ask_masked(
-        self,
-        user_prompts_masked: List[Optional[str]],
-        *,
-        verbose: bool = True,
-        num_outputs: Union[int, List[int]] = 1,
-        seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
-    ) -> List[Optional[Union[str, List[str]]]]:
-        """
-        Add a user turn for *selected* threads only (None = skip that thread),
-        submit one batch containing just the active threads, and return a list
-        of replies aligned to thread indices (None where skipped).
-
-        Threads requesting more than one completion return a ``List[str]`` entry.
-        """
-        if len(user_prompts_masked) != self.count:
-            raise ValueError(f"user_prompts_masked length {len(user_prompts_masked)} must match count={self.count}")
-
-        # Determine active threads for this step
-        active_indices = [i for i, p in enumerate(user_prompts_masked) if p is not None]
-        if not active_indices:
-            return [None] * self.count  # no-op step, no increment
-
-        now = time.time()
-        for i in active_indices:
-            self._threads[i].append(_Turn("user", user_prompts_masked[i] or "", now))
-
-        per_thread_counts = _broadcast_counts(num_outputs, self.count, "num_outputs")
-        per_thread_seeds = _normalize_seed_grid(seeds, per_thread_counts, "seeds")
-
-        active_counts = [per_thread_counts[i] for i in active_indices]
-        active_seeds = [per_thread_seeds[i] for i in active_indices]
-
-        # Build payload only for active threads
-        messages_per_item: List[List[Dict[str, str]]] = []
-        ns = f"conv::step{self.step}"
-
-        # Assemble lines *in active order*; track mapping to thread index
-        for i in active_indices:
-            msgs = [t.to_msg() for t in self._threads[i]]
-            messages_per_item.append(msgs)
-
         lines, custom_ids, slot_map = _assemble_jsonl_lines(
             messages_per_item=messages_per_item,
             model=self.model,
@@ -713,11 +667,12 @@ class BatchConversation:
         )
         out_records = _run_batch_and_collect(lines, self.completion_window, verbose=verbose)
 
-        # Collect outputs mapped back to thread index and variant slot
+        # Map outputs back to thread indices
         slot_to_reply: Dict[int, List[str]] = {
-            idx: [""] * per_thread_counts[idx] for idx in active_indices
+            idx: [""] * counts[idx] for idx in active_indices
         }
         slot_lookup = {cid: slot for cid, slot in zip(custom_ids, slot_map)}
+        
         for r in out_records:
             cid = r.get("custom_id")
             resp = (r.get("response") or {})
@@ -731,7 +686,7 @@ class BatchConversation:
             thread_idx = active_indices[slot_idx]
             slot_to_reply[thread_idx][variant_idx] = _extract_output_text(body)
 
-        # Append assistant turns for active threads
+        # Append assistant turns
         now2 = time.time()
         for i in active_indices:
             reply = slot_to_reply[i][0]
@@ -741,7 +696,7 @@ class BatchConversation:
         out: List[Optional[Union[str, List[str]]]] = [None] * self.count
         for i in active_indices:
             variants = slot_to_reply[i]
-            if len(variants) == 1:
+            if counts[i] == 1:
                 out[i] = variants[0]
             else:
                 out[i] = list(variants)
@@ -756,6 +711,8 @@ class BatchConversation:
         verbose: bool = True,
         num_outputs: Union[int, List[int]] = 1,
         seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
+        use_batch: bool = True,
+        max_workers: Optional[int] = None,
     ) -> Dict[int, Union[str, List[str]]]:
         """
         Convenience wrapper: provide {thread_index: prompt}. Returns {thread_index: reply}.
@@ -765,11 +722,13 @@ class BatchConversation:
             if i < 0 or i >= self.count:
                 raise IndexError(f"thread index out of range: {i}")
             masked[i] = p
-        replies = self.ask_masked(
+        replies = self.ask(
             masked,
             verbose=verbose,
             num_outputs=num_outputs,
             seeds=seeds,
+            use_batch=use_batch,
+            max_workers=max_workers,
         )
         return {i: (replies[i] if replies[i] is not None else "") for i in prompt_map.keys()}
 
