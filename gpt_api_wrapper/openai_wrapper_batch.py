@@ -127,6 +127,7 @@ def _normalize_seed_grid(
 def _extract_output_text(body: Dict[str, Any]) -> str:
     """
     Extract plain text from Responses API response body (batch shape).
+    Handles both regular messages and file_search_call outputs.
     """
     if isinstance(body, dict) and body.get("output_text"):
         return str(body["output_text"]).strip()
@@ -138,6 +139,12 @@ def _extract_output_text(body: Dict[str, Any]) -> str:
                 t = c.get("text", "")
                 if t:
                     pieces.append(t)
+        elif item.get("type") == "file_search_call":
+            # Include file search info if desired
+            status = item.get("status", "unknown")
+            queries = item.get("queries", [])
+            if status == "completed" and queries:
+                pieces.append(f"[File search executed: {', '.join(queries)}]")
     return "\n".join(pieces).strip()
 
 def _write_jsonl(records: Iterable[Dict[str, Any]]) -> str:
@@ -203,6 +210,8 @@ def _assemble_jsonl_lines(
     namespace: str = "job",
     outputs_per_item: Optional[List[int]] = None,
     seeds_per_item: Optional[List[List[Optional[int]]]] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    include: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], List[Tuple[int, int]]]:
     """
     Build batch input JSONL lines for /v1/responses.
@@ -246,6 +255,10 @@ def _assemble_jsonl_lines(
             seed_value = seed_row[variant_idx]
             if seed_value is not None:
                 body["seed"] = int(seed_value)
+            if tools is not None:
+                body["tools"] = tools
+            if include is not None:
+                body["include"] = include
             lines.append({
                 "custom_id": custom_id,
                 "method": "POST",
@@ -363,9 +376,19 @@ def batch_single_prompt(
     verbose: bool = True,
     num_outputs: Union[int, List[int]] = 1,
     seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    include: Optional[List[str]] = None,
 ) -> Union[List[str], List[List[str]]]:
     """
     Submit one or many prompts as a single batch job.
+
+    Parameters
+    ----------
+    tools : list[dict], optional
+        Tools to enable (e.g., file_search). Example:
+        [{"type": "file_search", "vector_store_ids": ["vs_123"], "max_num_results": 5}]
+    include : list[str], optional
+        Additional data to include in response (e.g., ["file_search_call.results"])
 
     Returns
     -------
@@ -396,6 +419,8 @@ def batch_single_prompt(
         namespace="single",
         outputs_per_item=counts,
         seeds_per_item=seeds_grid,
+        tools=tools,
+        include=include,
     )
     out_records = _run_batch_and_collect(lines, completion_window, verbose=verbose)
 
@@ -439,6 +464,8 @@ class BatchConversation:
 
     New: .ask_masked([...Optional[str]...]) lets you advance only the threads that
     still have pending turns (None = skip).
+    
+    File search support: Pass tools parameter to enable file_search with vector stores.
     """
 
     def __init__(
@@ -451,6 +478,8 @@ class BatchConversation:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         completion_window: str = DEFAULT_COMPLETION_WINDOW,
         run_tag: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        include: Optional[List[str]] = None,
     ) -> None:
         if count <= 0:
             raise ValueError("count must be >= 1")
@@ -461,6 +490,8 @@ class BatchConversation:
         self.completion_window = completion_window
         self.run_tag = run_tag or uuid.uuid4().hex[:10]
         self.step = 0
+        self.tools = tools
+        self.include = include
 
         systems = _as_list(system_prompt, count, "system_prompt")
         self._threads: List[List[_Turn]] = []
@@ -481,6 +512,8 @@ class BatchConversation:
             "completion_window": self.completion_window,
             "run_tag": self.run_tag,
             "step": self.step,
+            "tools": self.tools,
+            "include": self.include,
             "threads": [
                 [asdict(t) for t in thread] for thread in self._threads
             ],
@@ -500,6 +533,8 @@ class BatchConversation:
             max_output_tokens=int(data.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)),
             completion_window=data.get("completion_window", DEFAULT_COMPLETION_WINDOW),
             run_tag=data.get("run_tag"),
+            tools=data.get("tools"),
+            include=data.get("include"),
         )
         obj.step = int(data.get("step", 0))
         obj._threads = [
@@ -525,28 +560,21 @@ class BatchConversation:
         seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
         use_batch: bool = True,
         max_workers: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        include: Optional[List[str]] = None,
     ) -> Union[List[Optional[str]], List[Optional[List[str]]]]:
         """
         Add a user turn across threads, submit a batch or make synchronous calls,
         append assistant replies, and return the replies.
 
-        User prompts can be:
-        - A single string (broadcast to all threads)
-        - A list with string values (one per thread)
-        - A list with Optional[str] values (None = skip that thread this step)
-
-        When ``num_outputs`` requests more than one completion for any thread the
-        returned structure becomes ``List[Optional[List[str]]]`` (one list per active thread,
-        None for skipped threads).
-        
         Parameters
         ----------
-        user_prompts : str | list[str | None]
-            User prompt(s). Use None in list to skip a thread.
-        use_batch : bool
-            If True (default), use batch API. If False, make synchronous calls in parallel.
-        max_workers : int, optional
-            Maximum number of parallel workers for synchronous mode.
+        tools : list[dict], optional
+            Tools to enable for this request. Overrides instance default if provided.
+            Example: [{"type": "file_search", "vector_store_ids": ["vs_123"]}]
+        include : list[str], optional
+            Additional data to include. Overrides instance default if provided.
+            Example: ["file_search_call.results"]
         
         Returns
         -------
@@ -574,6 +602,9 @@ class BatchConversation:
         for i in active_indices:
             self._threads[i].append(_Turn("user", prompts[i] or "", now))
 
+        effective_tools = tools if tools is not None else self.tools
+        effective_include = include if include is not None else self.include
+
         if not use_batch:
             # Synchronous mode with parallel execution
             client = _get_client()
@@ -596,6 +627,11 @@ class BatchConversation:
                 seed_value = thread_seeds[variant_idx]
                 if seed_value is not None:
                     kwargs["seed"] = int(seed_value)
+                
+                if effective_tools is not None:
+                    kwargs["tools"] = effective_tools
+                if effective_include is not None:
+                    kwargs["include"] = effective_include
                 
                 if verbose:
                     print(f"[sync] thread {thread_idx}, variant {variant_idx}")
@@ -664,6 +700,8 @@ class BatchConversation:
             namespace=ns,
             outputs_per_item=active_counts,
             seeds_per_item=active_seeds,
+            tools=effective_tools,
+            include=effective_include,
         )
         out_records = _run_batch_and_collect(lines, self.completion_window, verbose=verbose)
 
@@ -713,6 +751,8 @@ class BatchConversation:
         seeds: Optional[Union[int, List[Optional[int]], List[List[Optional[int]]]]] = None,
         use_batch: bool = True,
         max_workers: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        include: Optional[List[str]] = None,
     ) -> Dict[int, Union[str, List[str]]]:
         """
         Convenience wrapper: provide {thread_index: prompt}. Returns {thread_index: reply}.
@@ -729,6 +769,8 @@ class BatchConversation:
             seeds=seeds,
             use_batch=use_batch,
             max_workers=max_workers,
+            tools=tools,
+            include=include,
         )
         return {i: (replies[i] if replies[i] is not None else "") for i in prompt_map.keys()}
 
